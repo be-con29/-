@@ -1,15 +1,17 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 /* ============================================================
-   船跡 — ステップ3
-   海岸線（OpenStreetMap）＋ 航路標識（OpenSeaMap）の上に航跡を描く
-   圏外になったらタイルを諦めて、暗い背景＋航跡だけの表示に戻る
+   船跡 — ステップ4
+   航跡 ＋ 海図レイヤー ＋ 海況（天気 / 風 / 波 / 雨雲レーダー）
+
+   ※ Open-Meteo と RainViewer は「非商用なら無料」の条件です。
+      有料化する前に、それぞれ商用の契約に切り替えてください。
    ============================================================ */
 
 const C = {
   deep: "#04141D", panel: "#0A2230", rule: "#16414F",
   text: "#B8D2DC", dim: "#5D8494", head: "#EAF6FA",
-  red: "#FF5E5B", ok: "#4ED9C0",
+  red: "#FF5E5B", ok: "#4ED9C0", warn: "#FFC13D",
 };
 
 const RAMP = [
@@ -31,6 +33,19 @@ function speedColor(kn) {
 }
 const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
 const KN = 0.514444;
+
+const DIRS = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
+              "南","南南西","南西","西南西","西","西北西","北西","北北西"];
+const dirName = (deg) => DIRS[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
+
+// WMO の天気コード → 日本語
+const WMO = {
+  0:"快晴",1:"晴れ",2:"薄曇り",3:"曇り",45:"霧",48:"霧",
+  51:"霧雨",53:"霧雨",55:"強い霧雨",61:"小雨",63:"雨",65:"大雨",
+  71:"小雪",73:"雪",75:"大雪",77:"霧雪",
+  80:"にわか雨",81:"にわか雨",82:"激しいにわか雨",
+  85:"にわか雪",86:"にわか雪",95:"雷雨",96:"雷雨",99:"激しい雷雨",
+};
 
 function meters(p, ref) {
   return {
@@ -66,7 +81,6 @@ function simplify(pts, tol) {
   return pts.filter((_, i) => keep[i]);
 }
 
-/* --- Leaflet を CDN から読み込む（npm 追加なしで動かすため） --- */
 function useLeaflet() {
   const [L, setL] = useState(null);
   useEffect(() => {
@@ -90,23 +104,29 @@ export default function App() {
   const [acc, setAcc] = useState(null);
   const [online, setOnline] = useState(navigator.onLine);
   const [follow, setFollow] = useState(true);
-  const [seamark, setSeamark] = useState(true);
+  const [seamark, setSeamark] = useState(false);
+  const [radar, setRadar] = useState(false);
+  const [radarTime, setRadarTime] = useState(null);
+  const [wx, setWx] = useState(null);
+  const [wxBusy, setWxBusy] = useState(false);
+  const [showWx, setShowWx] = useState(false);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
   const mapElRef = useRef(null);
   const seaRef = useRef(null);
-  const segRef = useRef([]);      // 描画済みの線
+  const radarRef = useRef(null);
+  const segRef = useRef([]);
   const boatRef = useRef(null);
   const watchRef = useRef(null);
   const lastRef = useRef(null);
   const wakeRef = useRef(null);
-  const canvasRef = useRef(null); // 圏外用
+  const canvasRef = useRef(null);
   const wrapRef = useRef(null);
 
   const mono = `ui-monospace, "SF Mono", Menlo, monospace`;
 
-  /* ---------- オンライン / 圏外の監視 ---------- */
+  /* ---------- 圏内 / 圏外 ---------- */
   useEffect(() => {
     const on = () => setOnline(true), off = () => setOnline(false);
     window.addEventListener("online", on);
@@ -117,38 +137,29 @@ export default function App() {
     };
   }, []);
 
-  /* ---------- 地図の初期化 ---------- */
+  /* ---------- 地図 ---------- */
   useEffect(() => {
     if (!L || !mapElRef.current || mapRef.current || !online) return;
-
     const map = L.map(mapElRef.current, {
-      zoomControl: false,
-      attributionControl: true,
-      preferCanvas: true,
-    }).setView([34.6576, 137.1787], 13);
+      zoomControl: false, preferCanvas: true,
+    }).setView([34.6, 137.1], 12);
 
-    // 1. 海岸線・陸地
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors",
+      maxZoom: 19, attribution: "&copy; OpenStreetMap",
     }).addTo(map);
 
-    // 2. 航路標識・ブイ・灯台
     seaRef.current = L.tileLayer(
       "https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
       { maxZoom: 18, attribution: "&copy; OpenSeaMap" }
-    ).addTo(map);
+    );
 
     L.control.zoom({ position: "bottomleft" }).addTo(map);
-
-    // 手で動かしたら追従をやめる
     map.on("dragstart", () => setFollow(false));
-
     mapRef.current = map;
     setTimeout(() => map.invalidateSize(), 100);
   }, [L, online]);
 
-  /* ---------- 航路標識レイヤーの ON / OFF ---------- */
+  /* ---------- 航路標識レイヤー ---------- */
   useEffect(() => {
     const map = mapRef.current, sea = seaRef.current;
     if (!map || !sea) return;
@@ -156,54 +167,126 @@ export default function App() {
     else if (map.hasLayer(sea)) map.removeLayer(sea);
   }, [seamark]);
 
-  /* ---------- 地図の上に航跡を描き足す ---------- */
+  /* ---------- 雨雲レーダー ---------- */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!L || !map) return;
+
+    if (!radar) {
+      if (radarRef.current) { map.removeLayer(radarRef.current); radarRef.current = null; }
+      return;
+    }
+    let dead = false;
+    (async () => {
+      try {
+        const r = await fetch("https://api.rainviewer.com/public/weather-maps.json");
+        const d = await r.json();
+        const frames = d?.radar?.past || [];
+        const f = frames[frames.length - 1];
+        if (!f || dead) return;
+        setRadarTime(new Date(f.time * 1000));
+        if (radarRef.current) map.removeLayer(radarRef.current);
+        radarRef.current = L.tileLayer(
+          `${d.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`,
+          { opacity: 0.62, maxZoom: 12, attribution: "Weather data by RainViewer" }
+        ).addTo(map);
+      } catch { /* 取れなければ静かに諦める */ }
+    })();
+    return () => { dead = true; };
+  }, [L, radar]);
+
+  /* ---------- 海況の取得 ---------- */
+  const loadWx = useCallback(async () => {
+    const p = pts[pts.length - 1];
+    const c = mapRef.current?.getCenter();
+    const lat = p?.lat ?? c?.lat ?? 34.6;
+    const lng = p?.lng ?? c?.lng ?? 137.1;
+
+    setWxBusy(true);
+    try {
+      const [a, b] = await Promise.all([
+        fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}` +
+          `&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m` +
+          `&hourly=wind_speed_10m,wind_gusts_10m,wind_direction_10m,weather_code` +
+          `&wind_speed_unit=ms&timezone=Asia%2FTokyo&forecast_days=2`).then((r) => r.json()),
+        fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lng}` +
+          `&current=wave_height,wave_direction,wave_period,sea_surface_temperature` +
+          `&hourly=wave_height&timezone=Asia%2FTokyo&forecast_days=2`)
+          .then((r) => r.json()).catch(() => null),
+      ]);
+
+      // いまの時刻に対応する配列の位置を探す
+      const now = new Date();
+      const idx = Math.max(0, (a.hourly?.time || []).findIndex(
+        (t) => new Date(t) >= new Date(now.getTime() - 3600000)
+      ));
+
+      const hours = [];
+      for (let i = idx; i < Math.min(idx + 12, a.hourly.time.length); i++) {
+        hours.push({
+          t: new Date(a.hourly.time[i]),
+          wind: a.hourly.wind_speed_10m[i],
+          gust: a.hourly.wind_gusts_10m[i],
+          dir: a.hourly.wind_direction_10m[i],
+          wave: b?.hourly?.wave_height?.[i] ?? null,
+        });
+      }
+
+      setWx({
+        temp: a.current?.temperature_2m,
+        code: a.current?.weather_code,
+        wind: a.current?.wind_speed_10m,
+        gust: a.current?.wind_gusts_10m,
+        dir: a.current?.wind_direction_10m,
+        wave: b?.current?.wave_height ?? null,
+        wavePeriod: b?.current?.wave_period ?? null,
+        waveDir: b?.current?.wave_direction ?? null,
+        sst: b?.current?.sea_surface_temperature ?? null,
+        hours,
+        at: new Date(),
+      });
+    } catch {
+      setWx(null);
+    }
+    setWxBusy(false);
+  }, [pts]);
+
+  useEffect(() => {
+    if (showWx && !wx && !wxBusy) loadWx();
+  }, [showWx, wx, wxBusy, loadWx]);
+
+  /* ---------- 航跡の描画 ---------- */
   useEffect(() => {
     const map = mapRef.current;
     if (!L || !map || pts.length < 2) return;
-
-    // まだ線を引いていない区間だけ追加する（毎回引き直さない）
     for (let i = segRef.current.length + 1; i < pts.length; i++) {
       const a = pts[i - 1], b = pts[i];
-      // 5秒以上あいたら別の区間とみなして線をつながない
-      const gap = b.t - a.t > 15000;
-      const line = L.polyline(
-        [[a.lat, a.lng], [b.lat, b.lng]],
-        {
+      const gap = b.t - a.t > 15000; // 15秒以上あいたら線をつながない
+      segRef.current.push(
+        L.polyline([[a.lat, a.lng], [b.lat, b.lng]], {
           color: rgb(speedColor((a.kn + b.kn) / 2)),
           weight: a.kn < 5 ? 6 : 4,
           opacity: gap ? 0 : 0.9,
           lineCap: "round",
-        }
-      ).addTo(map);
-      segRef.current.push(line);
+        }).addTo(map)
+      );
     }
-
-    // 現在位置
     const cur = pts[pts.length - 1];
     if (!boatRef.current) {
       boatRef.current = L.circleMarker([cur.lat, cur.lng], {
-        radius: 7, color: "#fff", weight: 2,
-        fillColor: C.red, fillOpacity: 1,
+        radius: 7, color: "#fff", weight: 2, fillColor: C.red, fillOpacity: 1,
       }).addTo(map);
-    } else {
-      boatRef.current.setLatLng([cur.lat, cur.lng]);
-    }
+    } else boatRef.current.setLatLng([cur.lat, cur.lng]);
     if (follow) map.panTo([cur.lat, cur.lng], { animate: true, duration: 0.4 });
   }, [L, pts, follow]);
 
-  /* ---------- 記録開始 ---------- */
+  /* ---------- 記録 ---------- */
   const start = useCallback(async () => {
-    if (!navigator.geolocation) {
-      setErr("この環境では位置情報を取得できません。");
-      return;
-    }
+    if (!navigator.geolocation) { setErr("位置情報を取得できません。"); return; }
     setErr(null);
-    // 地図上の古い航跡を消す
     segRef.current.forEach((s) => s.remove());
     segRef.current = [];
-    setPts([]); lastRef.current = null;
-    setFollow(true);
-
+    setPts([]); lastRef.current = null; setFollow(true);
     try { wakeRef.current = await navigator.wakeLock?.request("screen"); } catch {}
 
     watchRef.current = navigator.geolocation.watchPosition(
@@ -212,7 +295,6 @@ export default function App() {
         setAcc(c.accuracy);
         const p = { lat: c.latitude, lng: c.longitude, t: pos.timestamp };
         const prev = lastRef.current;
-
         if (prev) {
           const m = meters(p, prev);
           const dist = Math.hypot(m.x, m.y);
@@ -226,7 +308,6 @@ export default function App() {
           mapRef.current?.setView([p.lat, p.lng], 16);
         }
         if (p.hdg < 0) p.hdg += 360;
-
         lastRef.current = p;
         setPts((a) => [...a, p]);
       },
@@ -251,7 +332,6 @@ export default function App() {
   }, []);
 
   useEffect(() => () => stop(), [stop]);
-
   useEffect(() => {
     const h = async () => {
       if (rec && document.visibilityState === "visible" && !wakeRef.current) {
@@ -275,7 +355,7 @@ export default function App() {
     return { xy, dist, max, thin: simplify(xy, 5).length };
   }, [pts]);
 
-  /* ---------- 圏外用の描画（地図タイルなし） ---------- */
+  /* ---------- 圏外の描画 ---------- */
   useEffect(() => {
     if (online) return;
     const cv = canvasRef.current, wrap = wrapRef.current;
@@ -288,7 +368,6 @@ export default function App() {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, W, H);
     if (!view) return;
-
     const { xy } = view;
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
     for (const p of xy) {
@@ -300,9 +379,7 @@ export default function App() {
     const ox = (W - (x1 - x0) * s) / 2, oy = (H - (y1 - y0) * s) / 2;
     const X = (p) => ox + (p.x - x0) * s;
     const Y = (p) => H - (oy + (p.y - y0) * s);
-
-    g.lineCap = g.lineJoin = "round";
-    g.shadowBlur = 9;
+    g.lineCap = g.lineJoin = "round"; g.shadowBlur = 9;
     for (let i = 1; i < xy.length; i++) {
       const a = xy[i - 1], b = xy[i];
       const col = rgb(speedColor((a.kn + b.kn) / 2));
@@ -336,8 +413,7 @@ ${seg}
     const blob = new Blob([body], { type });
     const file = new File([blob], name, { type });
     if (navigator.canShare?.({ files: [file] })) {
-      navigator.share({ files: [file] }).catch(() => {});
-      return;
+      navigator.share({ files: [file] }).catch(() => {}); return;
     }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = name; a.click();
@@ -352,11 +428,15 @@ ${seg}
     font: `500 12px ${mono}`, letterSpacing: ".12em", cursor: "pointer",
   };
   const chip = (on) => ({
-    padding: "5px 10px", fontSize: 10, letterSpacing: ".1em",
-    background: on ? "rgba(78,217,192,.14)" : "rgba(4,20,29,.78)",
+    padding: "6px 10px", fontSize: 10, letterSpacing: ".08em",
+    background: on ? "rgba(78,217,192,.15)" : "rgba(4,20,29,.8)",
     border: `1px solid ${on ? C.ok : C.rule}`,
-    color: on ? C.ok : C.dim, cursor: "pointer",
+    color: on ? C.ok : C.dim, cursor: "pointer", fontFamily: mono,
   });
+
+  // 風速に応じた色（8m/s 超えたら注意、12 超えたら危険）
+  const windColor = (ms) => (ms >= 12 ? C.red : ms >= 8 ? C.warn : C.ok);
+  const maxWind = wx ? Math.max(12, ...wx.hours.map((h) => h.gust || h.wind)) : 12;
 
   return (
     <div style={{
@@ -398,26 +478,33 @@ ${seg}
         }}>{err}</div>
       )}
 
-      {/* 地図（圏内） / 航跡のみ（圏外） */}
+      {/* 地図 / 圏外画面 */}
       <div ref={wrapRef} style={{ position: "relative", flex: 1, minHeight: 340 }}>
-        {online ? (
-          <div ref={mapElRef} style={{ position: "absolute", inset: 0 }} />
-        ) : (
-          <canvas ref={canvasRef} style={{ display: "block" }} />
-        )}
+        {online ? <div ref={mapElRef} style={{ position: "absolute", inset: 0 }} />
+                : <canvas ref={canvasRef} style={{ display: "block" }} />}
 
-        {/* レイヤー切り替え */}
         {online && (
           <div style={{
             position: "absolute", top: 12, right: 12, zIndex: 500,
             display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end",
           }}>
+            <button onClick={() => setShowWx((v) => !v)} style={chip(showWx)}>海況</button>
+            <button onClick={() => setRadar((v) => !v)} style={chip(radar)}>雨雲</button>
             <button onClick={() => setSeamark((v) => !v)} style={chip(seamark)}>航路標識</button>
             <button onClick={() => setFollow((v) => !v)} style={chip(follow)}>自船追従</button>
           </div>
         )}
 
-        {/* 計器 */}
+        {radar && radarTime && (
+          <div style={{
+            position: "absolute", bottom: 14, right: 12, zIndex: 500,
+            background: "rgba(4,20,29,.82)", border: `1px solid ${C.rule}`,
+            padding: "4px 9px", fontSize: 10, color: C.dim,
+          }}>
+            雨雲 {radarTime.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}
+          </div>
+        )}
+
         {last && (
           <div style={{
             position: "absolute", top: 12, left: 12, zIndex: 500,
@@ -434,12 +521,105 @@ ${seg}
           </div>
         )}
 
-        {!pts.length && !err && (
+        {/* 海況パネル */}
+        {showWx && online && (
           <div style={{
-            position: "absolute", bottom: 16, left: 0, right: 0, zIndex: 500,
-            fontSize: 11, color: C.dim, textAlign: "center", pointerEvents: "none",
+            position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 600,
+            background: "rgba(6,25,36,.96)", borderTop: `1px solid ${C.rule}`,
+            padding: "14px 16px 16px", maxHeight: "72%", overflowY: "auto",
           }}>
-            記録を開始して 10m 以上動いてください
+            <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
+              <span style={{ ...label, color: C.head }}>海況</span>
+              <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                <button onClick={loadWx} style={chip(false)}>更新</button>
+                <button onClick={() => setShowWx(false)} style={chip(false)}>閉じる</button>
+              </span>
+            </div>
+
+            {wxBusy && <div style={{ fontSize: 12, color: C.dim, padding: "18px 0" }}>読み込み中…</div>}
+
+            {!wxBusy && !wx && (
+              <div style={{ fontSize: 12, color: C.dim, padding: "18px 0", lineHeight: 1.8 }}>
+                海況を取得できませんでした。電波状況を確認して「更新」を押してください。
+              </div>
+            )}
+
+            {!wxBusy && wx && (
+              <>
+                {/* 現在値 */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 1,
+                              background: C.rule, border: `1px solid ${C.rule}` }}>
+                  <div style={{ background: C.deep, padding: "11px 13px" }}>
+                    <div style={label}>天気</div>
+                    <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
+                      {WMO[wx.code] ?? "—"}
+                      <span style={{ fontSize: 12, color: C.dim, marginLeft: 7 }}>
+                        {wx.temp?.toFixed(1)}℃
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ background: C.deep, padding: "11px 13px" }}>
+                    <div style={label}>風</div>
+                    <div style={{ fontSize: 17, color: windColor(wx.wind), marginTop: 4 }}>
+                      {dirName(wx.dir)} {wx.wind?.toFixed(1)}
+                      <span style={{ fontSize: 10, color: C.dim, marginLeft: 3 }}>m/s</span>
+                    </div>
+                    <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>
+                      最大瞬間 {wx.gust?.toFixed(1)} m/s
+                    </div>
+                  </div>
+                  <div style={{ background: C.deep, padding: "11px 13px" }}>
+                    <div style={label}>波</div>
+                    <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
+                      {wx.wave != null ? `${wx.wave.toFixed(1)} m` : "—"}
+                    </div>
+                    <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>
+                      {wx.wavePeriod != null ? `周期 ${wx.wavePeriod.toFixed(0)}秒` : ""}
+                      {wx.waveDir != null ? ` · ${dirName(wx.waveDir)}から` : ""}
+                    </div>
+                  </div>
+                  <div style={{ background: C.deep, padding: "11px 13px" }}>
+                    <div style={label}>水温</div>
+                    <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
+                      {wx.sst != null ? `${wx.sst.toFixed(1)} ℃` : "—"}
+                    </div>
+                  </div>
+                </div>
+
+                {/* 12時間の推移 */}
+                <div style={{ ...label, marginTop: 16, marginBottom: 8 }}>これから12時間</div>
+                <div style={{ display: "flex", gap: 3, alignItems: "flex-end" }}>
+                  {wx.hours.map((h, i) => {
+                    const v = h.gust || h.wind;
+                    return (
+                      <div key={i} style={{ flex: 1, textAlign: "center" }}>
+                        <div style={{ fontSize: 8, color: C.dim, marginBottom: 3 }}>
+                          {h.wave != null ? h.wave.toFixed(1) : ""}
+                        </div>
+                        <div style={{
+                          height: Math.max(4, (v / maxWind) * 54),
+                          background: windColor(h.wind),
+                          opacity: 0.85, borderRadius: 1,
+                        }} />
+                        <div style={{ fontSize: 8, color: C.dim, marginTop: 4 }}>
+                          {h.t.getHours()}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 9, color: C.dim, marginTop: 8, lineHeight: 1.7 }}>
+                  棒＝最大瞬間風速（黄8m/s以上・赤12m/s以上）、上の数字＝波高(m)、下＝時刻
+                </div>
+
+                <div style={{ fontSize: 9, color: C.dim, marginTop: 14, lineHeight: 1.8,
+                              borderTop: `1px solid ${C.rule}`, paddingTop: 10 }}>
+                  予報：Open-Meteo ／ 雨雲：Weather data by RainViewer<br />
+                  外洋の波浪モデルは約28kmメッシュです。湾内や沿岸の細かい海況は実際と異なる場合があります。
+                  出港の判断は気象庁の海上警報を必ず確認してください。
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -466,10 +646,8 @@ ${seg}
 
       {/* 操作 */}
       <div style={{ padding: 14, background: C.panel, display: "flex", gap: 9 }}>
-        <button
-          onClick={rec ? stop : start}
-          style={{ ...btn, borderColor: rec ? C.red : C.ok, color: rec ? C.red : C.ok }}
-        >
+        <button onClick={rec ? stop : start}
+          style={{ ...btn, borderColor: rec ? C.red : C.ok, color: rec ? C.red : C.ok }}>
           {rec ? "記録を停止" : "記録を開始"}
         </button>
         {pts.length > 1 && !rec && (
