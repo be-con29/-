@@ -54,6 +54,64 @@ function meters(p, ref) {
   };
 }
 
+/* ============================================================
+   気象庁 潮位表の観測地点（記号・名前・緯度・経度）
+   ============================================================ */
+const TIDE_STN = [
+  ["WN","稚内",45.40,141.68],["KR","釧路",42.98,144.37],["HK","函館",41.78,140.72],
+  ["B3","小樽",43.20,141.00],["TM","苫小牧",42.63,141.62],["AO","青森",40.83,140.77],
+  ["HG","八戸",40.53,141.55],["MY","宮古",39.65,141.98],["AY","鮎川",38.30,141.50],
+  ["SG","塩釜",38.32,141.03],["ON","小名浜",36.93,140.90],["S9","酒田",38.92,139.82],
+  ["CS","銚子",35.75,140.87],["CB","千葉港",35.60,140.10],["TK","東京",35.65,139.77],
+  ["QS","横浜",35.45,139.65],["Z1","油壺",35.17,139.62],["TT","館山",34.98,139.85],
+  ["ZF","勝浦",35.13,140.25],["OK","大島岡田",34.78,139.38],["OD","小田原",35.23,139.15],
+  ["Z3","伊東",34.90,139.13],["D6","下田",34.68,138.97],["G9","石廊崎",34.62,138.85],
+  ["SM","清水港",35.02,138.52],["OM","御前崎",34.62,138.22],["MI","舞阪",34.68,137.62],
+  ["I4","赤羽根",34.60,137.18],["G4","三河",34.73,137.32],["G5","形原",34.78,137.18],
+  ["G8","衣浦",34.88,136.95],["ZD","鬼崎",34.90,136.82],["NG","名古屋",35.08,136.88],
+  ["G3","四日市港",34.97,136.63],["TB","鳥羽",34.48,136.82],["OW","尾鷲",34.08,136.20],
+  ["UR","浦神",33.57,135.90],["KS","串本",33.48,135.77],["SR","白浜",33.68,135.38],
+  ["WY","和歌山",34.22,135.15],["OS","大阪",34.65,135.43],["KB","神戸",34.68,135.18],
+  ["AK","明石",34.65,134.98],["ST","洲本",34.35,134.90],["TA","高松",34.35,134.05],
+  ["Q8","広島",34.35,132.47],["MT","松山",33.87,132.72],["UW","宇和島",33.23,132.55],
+  ["KC","高知",33.50,133.57],["MU","室戸岬",33.27,134.17],["TS","土佐清水",32.78,132.97],
+  ["QF","博多",33.62,130.40],["NS","長崎",32.73,129.87],["KU","熊本",32.75,130.57],
+  ["QC","大分",33.27,131.68],["X5","佐伯",32.95,131.97],["MG","宮崎",31.90,131.45],
+  ["KG","鹿児島",31.60,130.57],["MK","枕崎",31.27,130.30],["TJ","種子島",30.47,130.97],
+  ["O9","奄美",28.32,129.53],["NH","那覇",26.22,127.67],["IS","石垣",24.33,124.17],
+  ["HA","浜田",34.90,132.07],["SK","境",35.55,133.25],["MZ","舞鶴",35.48,135.38],
+  ["T1","金沢",36.62,136.60],["TY","富山",36.77,137.22],["T3","直江津",37.18,138.25],
+  ["S6","新潟",37.93,139.07],
+];
+
+function nearestStation(lat, lng) {
+  let best = TIDE_STN[27], bd = Infinity; // 既定は赤羽根
+  for (const s of TIDE_STN) {
+    const d = Math.hypot((s[2] - lat) * 111, (s[3] - lng) * 91);
+    if (d < bd) { bd = d; best = s; }
+  }
+  return { code: best[0], name: best[1], lat: best[2], lng: best[3], km: bd };
+}
+
+/* --- 月齢から潮名（大潮・中潮など）を出す --- */
+function tideName(date) {
+  // 2000年1月6日 18:14 UTC の新月を基準にした概算
+  const base = Date.UTC(2000, 0, 6, 18, 14);
+  const age = (((date.getTime() - base) / 86400000) % 29.530589 + 29.530589) % 29.530589;
+  const d = Math.floor(age) + 1; // 旧暦の日に相当
+  if (d <= 2 || (d >= 14 && d <= 17) || d >= 29) return { name: "大潮", age };
+  if (d >= 3 && d <= 6) return { name: "中潮", age };
+  if (d >= 7 && d <= 9) return { name: "小潮", age };
+  if (d === 10) return { name: "長潮", age };
+  if (d === 11) return { name: "若潮", age };
+  if (d >= 12 && d <= 13) return { name: "中潮", age };
+  if (d >= 18 && d <= 21) return { name: "中潮", age };
+  if (d >= 22 && d <= 24) return { name: "小潮", age };
+  if (d === 25) return { name: "長潮", age };
+  if (d === 26) return { name: "若潮", age };
+  return { name: "中潮", age };
+}
+
 function simplify(pts, tol) {
   if (tol <= 0 || pts.length < 3) return pts;
   const keep = new Uint8Array(pts.length);
@@ -114,6 +172,9 @@ export default function App() {
   const [wxPoint, setWxPoint] = useState(null);
   // 地点を動かすあいだパネルを縮める
   const [wxMin, setWxMin] = useState(false);
+  const [wxTab, setWxTab] = useState("wx");   // wx = 気象 / tide = 潮汐
+  const [tide, setTide] = useState(null);
+  const [tideBusy, setTideBusy] = useState(false);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
@@ -325,6 +386,71 @@ export default function App() {
     map.on("click", onTap);
     return () => map.off("click", onTap);
   }, [showWx, loadWx]);
+
+  /* ---------- 潮汐の取得 ---------- */
+  const loadTide = useCallback(async (pt) => {
+    const target = pt || wxPoint;
+    if (!target) return;
+    const st = nearestStation(target.lat, target.lng);
+
+    // 同じ地点なら取り直さない
+    if (tide?.st?.code === st.code) return;
+
+    setTideBusy(true);
+    const key = `tide:${st.code}:${new Date().toISOString().slice(0, 10)}`;
+
+    try {
+      // 一度取ったものは端末に残す。電波が切れても昨日の分が残る
+      const cached = localStorage.getItem(key);
+      if (cached) {
+        setTide({ st, ...JSON.parse(cached) });
+        setTideBusy(false);
+        return;
+      }
+    } catch {}
+
+    try {
+      const r = await fetch(`/api/tide?stn=${st.code}&days=5`);
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+      try { localStorage.setItem(key, JSON.stringify({ days: d.days })); } catch {}
+      setTide({ st, days: d.days });
+    } catch {
+      setTide({ st, days: null });
+    }
+    setTideBusy(false);
+  }, [wxPoint, tide]);
+
+  useEffect(() => {
+    if (showWx && wxTab === "tide" && wxPoint) loadTide(wxPoint);
+  }, [showWx, wxTab, wxPoint, loadTide]);
+
+  /* ---------- 今日の潮汐を組み立てる ---------- */
+  const today = useMemo(() => {
+    if (!tide?.days) return null;
+    const now = new Date();
+    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const d = tide.days[key];
+    if (!d) return null;
+
+    const vals = d.hourly.filter((v) => v != null);
+    const min = Math.min(...vals), max = Math.max(...vals);
+
+    // いまの潮位を前後の毎時値から補間する
+    const h = now.getHours(), m = now.getMinutes();
+    const a = d.hourly[h], b = h < 23 ? d.hourly[h + 1] : d.hourly[23];
+    const level = a != null && b != null ? a + (b - a) * (m / 60) : null;
+
+    // 次の満潮・干潮
+    const mins = h * 60 + m;
+    const next = [
+      ...d.high.map((e) => ({ ...e, kind: "満潮" })),
+      ...d.low.map((e) => ({ ...e, kind: "干潮" })),
+    ].filter((e) => e.h * 60 + e.m > mins)
+     .sort((x, y) => (x.h * 60 + x.m) - (y.h * 60 + y.m))[0] || null;
+
+    return { ...d, min, max, level, next, name: tideName(now) };
+  }, [tide]);
 
   /* ---------- 取得地点を地図の中心へ移す ---------- */
   const wxToCenter = useCallback(() => {
@@ -647,10 +773,12 @@ ${seg}
             padding: "14px 16px 16px", maxHeight: "58%", overflowY: "auto",
           }}>
             <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
-              <span style={{ ...label, color: C.head }}>海況</span>
+              <span style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => setWxTab("wx")} style={chip(wxTab === "wx")}>気象</button>
+                <button onClick={() => setWxTab("tide")} style={chip(wxTab === "tide")}>潮汐</button>
+              </span>
               <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
                 <button onClick={() => setWxMin(true)} style={chip(false)}>縮小 ▼</button>
-                <button onClick={() => loadWx()} style={chip(false)}>更新</button>
                 <button onClick={() => setShowWx(false)} style={chip(false)}>閉じる</button>
               </span>
             </div>
@@ -681,11 +809,16 @@ ${seg}
               </div>
             )}
 
+            {wxTab === "wx" && (
+              <>
             {wxBusy && <div style={{ fontSize: 12, color: C.dim, padding: "18px 0" }}>読み込み中…</div>}
 
             {!wxBusy && !wx && (
               <div style={{ fontSize: 12, color: C.dim, padding: "18px 0", lineHeight: 1.8 }}>
                 海況を取得できませんでした。電波状況を確認して「更新」を押してください。
+                <div style={{ marginTop: 10 }}>
+                  <button onClick={() => loadWx()} style={chip(false)}>更新</button>
+                </div>
               </div>
             )}
 
@@ -777,6 +910,137 @@ ${seg}
                   外洋の波浪モデルは約28kmメッシュです。湾内や沿岸の細かい海況は実際と異なる場合があります。
                   出港の判断は気象庁の海上警報を必ず確認してください。
                 </div>
+              </>
+            )}
+              </>
+            )}
+
+            {/* ===== 潮汐タブ ===== */}
+            {wxTab === "tide" && (
+              <>
+                {tideBusy && (
+                  <div style={{ fontSize: 12, color: C.dim, padding: "18px 0" }}>読み込み中…</div>
+                )}
+
+                {!tideBusy && tide && (
+                  <div style={{ fontSize: 11, color: C.dim, marginBottom: 12 }}>
+                    観測地点：<span style={{ color: C.head }}>{tide.st.name}</span>
+                    <span style={{ marginLeft: 7 }}>（この地点から約 {Math.round(tide.st.km)}km）</span>
+                  </div>
+                )}
+
+                {!tideBusy && tide && !today && (
+                  <div style={{ fontSize: 12, color: C.dim, padding: "18px 0", lineHeight: 1.8 }}>
+                    潮汐データを取得できませんでした。電波状況を確認してから開き直してください。
+                  </div>
+                )}
+
+                {!tideBusy && today && (
+                  <>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 1,
+                                  background: C.rule, border: `1px solid ${C.rule}` }}>
+                      <div style={{ background: C.deep, padding: "11px 12px" }}>
+                        <div style={label}>潮回り</div>
+                        <div style={{
+                          fontSize: 17, marginTop: 4,
+                          color: today.name.name === "大潮" ? C.warn : C.head,
+                        }}>{today.name.name}</div>
+                        <div style={{ fontSize: 9, color: C.dim, marginTop: 2 }}>
+                          月齢 {today.name.age.toFixed(1)}
+                        </div>
+                      </div>
+                      <div style={{ background: C.deep, padding: "11px 12px" }}>
+                        <div style={label}>現在の潮位</div>
+                        <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
+                          {today.level != null ? Math.round(today.level) : "—"}
+                          <span style={{ fontSize: 10, color: C.dim, marginLeft: 2 }}>cm</span>
+                        </div>
+                      </div>
+                      <div style={{ background: C.deep, padding: "11px 12px" }}>
+                        <div style={label}>干満差</div>
+                        <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
+                          {today.max - today.min}
+                          <span style={{ fontSize: 10, color: C.dim, marginLeft: 2 }}>cm</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {today.next && (
+                      <div style={{
+                        marginTop: 12, padding: "10px 12px",
+                        border: `1px solid ${C.ok}`, background: "rgba(78,217,192,.08)",
+                        fontSize: 13, color: C.ok,
+                      }}>
+                        次は {String(today.next.h).padStart(2, "0")}:{String(today.next.m).padStart(2, "0")} に
+                        <span style={{ fontWeight: 600 }}> {today.next.kind}</span>（{today.next.cm}cm）
+                      </div>
+                    )}
+
+                    {/* 潮位カーブ */}
+                    <div style={{ ...label, marginTop: 16, marginBottom: 6 }}>今日の潮位</div>
+                    <svg viewBox="0 0 340 96" style={{ width: "100%", height: 96, display: "block" }}>
+                      <polyline
+                        points={today.hourly.map((v, i) =>
+                          v == null ? "" :
+                          `${(i / 23) * 336 + 2},${90 - ((v - today.min) / Math.max(1, today.max - today.min)) * 76}`
+                        ).filter(Boolean).join(" ")}
+                        fill="none" stroke={C.ok} strokeWidth="2"
+                        strokeLinejoin="round" strokeLinecap="round"
+                      />
+                      {/* いまの時刻 */}
+                      <line
+                        x1={((new Date().getHours() + new Date().getMinutes() / 60) / 23) * 336 + 2} y1="4"
+                        x2={((new Date().getHours() + new Date().getMinutes() / 60) / 23) * 336 + 2} y2="90"
+                        stroke={C.red} strokeWidth="1.5" strokeDasharray="3 3"
+                      />
+                      {[0, 6, 12, 18, 23].map((h) => (
+                        <text key={h} x={(h / 23) * 336 + 2} y="96"
+                              fill={C.dim} fontSize="8" textAnchor="middle">{h}</text>
+                      ))}
+                    </svg>
+
+                    {/* 満潮・干潮の一覧 */}
+                    <div style={{ display: "flex", gap: 1, marginTop: 12,
+                                  background: C.rule, border: `1px solid ${C.rule}` }}>
+                      {[["満潮", today.high, C.head], ["干潮", today.low, C.dim]].map(([k, arr, col]) => (
+                        <div key={k} style={{ flex: 1, background: C.deep, padding: "10px 12px" }}>
+                          <div style={label}>{k}</div>
+                          {arr.length === 0 && (
+                            <div style={{ fontSize: 12, color: C.dim, marginTop: 5 }}>—</div>
+                          )}
+                          {arr.map((e, i) => (
+                            <div key={i} style={{ fontSize: 13, color: col, marginTop: 5 }}>
+                              {String(e.h).padStart(2, "0")}:{String(e.m).padStart(2, "0")}
+                              <span style={{ fontSize: 10, color: C.dim, marginLeft: 6 }}>{e.cm}cm</span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* 潮流について */}
+                    <div style={{
+                      marginTop: 14, padding: "11px 12px",
+                      border: `1px solid ${C.rule}`, background: C.deep,
+                      fontSize: 10, color: C.dim, lineHeight: 1.8,
+                    }}>
+                      <span style={{ color: C.text }}>潮流について</span><br />
+                      伊良湖水道の潮流推算は、アプリに取り込める形では公開されていません。
+                      伊勢湾海上交通センターの
+                      <a href="https://www6.kaiho.mlit.go.jp/isewan/currenttide.html"
+                         target="_blank" rel="noreferrer"
+                         style={{ color: C.ok, marginLeft: 3 }}>潮汐・潮流情報</a>
+                      をご確認ください。
+                    </div>
+
+                    <div style={{ fontSize: 9, color: C.dim, marginTop: 14, lineHeight: 1.8,
+                                  borderTop: `1px solid ${C.rule}`, paddingTop: 10 }}>
+                      潮位データ 出典：気象庁（潮位表基準面上の値・予測値）<br />
+                      観測地点が離れているほど実際とのズレが大きくなります。
+                      航海には海上保安庁刊行の潮汐表をご使用ください。
+                    </div>
+                  </>
+                )}
               </>
             )}
           </div>
