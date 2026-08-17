@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 /* ============================================================
-   船跡 — ステップ2
-   iPhone の Safari で本物の GPS を記録して航跡を描く
+   船跡 — ステップ3
+   海岸線（OpenStreetMap）＋ 航路標識（OpenSeaMap）の上に航跡を描く
+   圏外になったらタイルを諦めて、暗い背景＋航跡だけの表示に戻る
    ============================================================ */
 
 const C = {
@@ -31,7 +32,6 @@ function speedColor(kn) {
 const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
 const KN = 0.514444;
 
-/* --- 緯度経度をメートルに直す（この規模なら十分な精度） --- */
 function meters(p, ref) {
   return {
     x: (p.lng - ref.lng) * 111320 * Math.cos((ref.lat * Math.PI) / 180),
@@ -39,7 +39,6 @@ function meters(p, ref) {
   };
 }
 
-/* --- 間引き（Douglas-Peucker） --- */
 function simplify(pts, tol) {
   if (tol <= 0 || pts.length < 3) return pts;
   const keep = new Uint8Array(pts.length);
@@ -67,39 +66,150 @@ function simplify(pts, tol) {
   return pts.filter((_, i) => keep[i]);
 }
 
+/* --- Leaflet を CDN から読み込む（npm 追加なしで動かすため） --- */
+function useLeaflet() {
+  const [L, setL] = useState(null);
+  useEffect(() => {
+    if (window.L) { setL(window.L); return; }
+    const css = document.createElement("link");
+    css.rel = "stylesheet";
+    css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+    document.head.appendChild(css);
+    const js = document.createElement("script");
+    js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    js.onload = () => setL(window.L);
+    document.head.appendChild(js);
+  }, []);
+  return L;
+}
+
 export default function App() {
   const [pts, setPts] = useState([]);
   const [rec, setRec] = useState(false);
   const [err, setErr] = useState(null);
   const [acc, setAcc] = useState(null);
+  const [online, setOnline] = useState(navigator.onLine);
+  const [follow, setFollow] = useState(true);
+  const [seamark, setSeamark] = useState(true);
 
+  const L = useLeaflet();
+  const mapRef = useRef(null);
+  const mapElRef = useRef(null);
+  const seaRef = useRef(null);
+  const segRef = useRef([]);      // 描画済みの線
+  const boatRef = useRef(null);
   const watchRef = useRef(null);
-  const lastRef = useRef(null);   // 10m フィルタ用の直近採用点
+  const lastRef = useRef(null);
   const wakeRef = useRef(null);
-  const canvasRef = useRef(null);
+  const canvasRef = useRef(null); // 圏外用
   const wrapRef = useRef(null);
 
   const mono = `ui-monospace, "SF Mono", Menlo, monospace`;
 
+  /* ---------- オンライン / 圏外の監視 ---------- */
+  useEffect(() => {
+    const on = () => setOnline(true), off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
+
+  /* ---------- 地図の初期化 ---------- */
+  useEffect(() => {
+    if (!L || !mapElRef.current || mapRef.current || !online) return;
+
+    const map = L.map(mapElRef.current, {
+      zoomControl: false,
+      attributionControl: true,
+      preferCanvas: true,
+    }).setView([34.6576, 137.1787], 13);
+
+    // 1. 海岸線・陸地
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    // 2. 航路標識・ブイ・灯台
+    seaRef.current = L.tileLayer(
+      "https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
+      { maxZoom: 18, attribution: "&copy; OpenSeaMap" }
+    ).addTo(map);
+
+    L.control.zoom({ position: "bottomleft" }).addTo(map);
+
+    // 手で動かしたら追従をやめる
+    map.on("dragstart", () => setFollow(false));
+
+    mapRef.current = map;
+    setTimeout(() => map.invalidateSize(), 100);
+  }, [L, online]);
+
+  /* ---------- 航路標識レイヤーの ON / OFF ---------- */
+  useEffect(() => {
+    const map = mapRef.current, sea = seaRef.current;
+    if (!map || !sea) return;
+    if (seamark) { if (!map.hasLayer(sea)) sea.addTo(map); }
+    else if (map.hasLayer(sea)) map.removeLayer(sea);
+  }, [seamark]);
+
+  /* ---------- 地図の上に航跡を描き足す ---------- */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!L || !map || pts.length < 2) return;
+
+    // まだ線を引いていない区間だけ追加する（毎回引き直さない）
+    for (let i = segRef.current.length + 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      // 5秒以上あいたら別の区間とみなして線をつながない
+      const gap = b.t - a.t > 15000;
+      const line = L.polyline(
+        [[a.lat, a.lng], [b.lat, b.lng]],
+        {
+          color: rgb(speedColor((a.kn + b.kn) / 2)),
+          weight: a.kn < 5 ? 6 : 4,
+          opacity: gap ? 0 : 0.9,
+          lineCap: "round",
+        }
+      ).addTo(map);
+      segRef.current.push(line);
+    }
+
+    // 現在位置
+    const cur = pts[pts.length - 1];
+    if (!boatRef.current) {
+      boatRef.current = L.circleMarker([cur.lat, cur.lng], {
+        radius: 7, color: "#fff", weight: 2,
+        fillColor: C.red, fillOpacity: 1,
+      }).addTo(map);
+    } else {
+      boatRef.current.setLatLng([cur.lat, cur.lng]);
+    }
+    if (follow) map.panTo([cur.lat, cur.lng], { animate: true, duration: 0.4 });
+  }, [L, pts, follow]);
+
   /* ---------- 記録開始 ---------- */
   const start = useCallback(async () => {
     if (!navigator.geolocation) {
-      setErr("この環境では位置情報を取得できません。iPhone の Safari で開いてください。");
+      setErr("この環境では位置情報を取得できません。");
       return;
     }
     setErr(null);
+    // 地図上の古い航跡を消す
+    segRef.current.forEach((s) => s.remove());
+    segRef.current = [];
     setPts([]); lastRef.current = null;
+    setFollow(true);
 
-    // 画面が消えると Safari は記録を止めるので、スリープを抑止する
-    try {
-      wakeRef.current = await navigator.wakeLock?.request("screen");
-    } catch { /* 非対応でも記録自体は続く */ }
+    try { wakeRef.current = await navigator.wakeLock?.request("screen"); } catch {}
 
     watchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
         const c = pos.coords;
         setAcc(c.accuracy);
-
         const p = { lat: c.latitude, lng: c.longitude, t: pos.timestamp };
         const prev = lastRef.current;
 
@@ -107,17 +217,13 @@ export default function App() {
           const m = meters(p, prev);
           const dist = Math.hypot(m.x, m.y);
           const dt = (p.t - prev.t) / 1000;
-          // 10m 進むか 5秒経つまでは捨てる
           if (dist < 10 && dt < 5) return;
-
-          // speed / heading は端末が返さないことが多いので自前で計算
           p.kn = (c.speed != null && c.speed >= 0 ? c.speed : dist / Math.max(dt, 0.1)) / KN;
           p.hdg = c.heading != null && c.heading >= 0
-            ? c.heading
-            : (Math.atan2(m.x, m.y) * 180) / Math.PI;
+            ? c.heading : (Math.atan2(m.x, m.y) * 180) / Math.PI;
         } else {
-          p.kn = 0;
-          p.hdg = 0;
+          p.kn = 0; p.hdg = 0;
+          mapRef.current?.setView([p.lat, p.lng], 16);
         }
         if (p.hdg < 0) p.hdg += 360;
 
@@ -125,12 +231,11 @@ export default function App() {
         setPts((a) => [...a, p]);
       },
       (e) => {
-        const msg = {
-          1: "位置情報が許可されていません。設定 → Safari → 位置情報 で許可してください。",
+        setErr({
+          1: "位置情報が許可されていません。設定 → プライバシー → 位置情報サービス を確認してください。",
           2: "現在地を取得できません。屋外で試してください。",
           3: "位置情報の取得がタイムアウトしました。",
-        };
-        setErr(msg[e.code] || "位置情報を取得できませんでした。");
+        }[e.code] || "位置情報を取得できませんでした。");
         setRec(false);
       },
       { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }
@@ -138,7 +243,6 @@ export default function App() {
     setRec(true);
   }, []);
 
-  /* ---------- 記録停止 ---------- */
   const stop = useCallback(() => {
     if (watchRef.current != null) navigator.geolocation.clearWatch(watchRef.current);
     watchRef.current = null;
@@ -148,7 +252,6 @@ export default function App() {
 
   useEffect(() => () => stop(), [stop]);
 
-  // 画面を戻したときスリープ抑止を張り直す
   useEffect(() => {
     const h = async () => {
       if (rec && document.visibilityState === "visible" && !wakeRef.current) {
@@ -169,15 +272,12 @@ export default function App() {
       dist += Math.hypot(xy[i].x - xy[i - 1].x, xy[i].y - xy[i - 1].y);
       if (xy[i].kn > max) max = xy[i].kn;
     }
-    return {
-      xy, dist, max,
-      mins: (pts[pts.length - 1].t - pts[0].t) / 60000,
-      thin: simplify(xy, 5).length,
-    };
+    return { xy, dist, max, thin: simplify(xy, 5).length };
   }, [pts]);
 
-  /* ---------- 描画 ---------- */
+  /* ---------- 圏外用の描画（地図タイルなし） ---------- */
   useEffect(() => {
+    if (online) return;
     const cv = canvasRef.current, wrap = wrapRef.current;
     if (!cv || !wrap) return;
     const dpr = window.devicePixelRatio || 1;
@@ -211,15 +311,10 @@ export default function App() {
       g.beginPath(); g.moveTo(X(a), Y(a)); g.lineTo(X(b), Y(b)); g.stroke();
     }
     g.shadowBlur = 0;
-
     const cur = xy[xy.length - 1];
-    g.save();
-    g.translate(X(cur), Y(cur)); g.rotate((cur.hdg * Math.PI) / 180);
     g.fillStyle = C.red;
-    g.beginPath(); g.moveTo(0, -8); g.lineTo(5.5, 7); g.lineTo(0, 4); g.lineTo(-5.5, 7);
-    g.closePath(); g.fill();
-    g.restore();
-  }, [view]);
+    g.beginPath(); g.arc(X(cur), Y(cur), 5, 0, 6.284); g.fill();
+  }, [online, view]);
 
   /* ---------- 書き出し ---------- */
   const save = (kind) => {
@@ -256,6 +351,12 @@ ${seg}
     border: `1px solid ${C.rule}`, color: C.head,
     font: `500 12px ${mono}`, letterSpacing: ".12em", cursor: "pointer",
   };
+  const chip = (on) => ({
+    padding: "5px 10px", fontSize: 10, letterSpacing: ".1em",
+    background: on ? "rgba(78,217,192,.14)" : "rgba(4,20,29,.78)",
+    border: `1px solid ${on ? C.ok : C.rule}`,
+    color: on ? C.ok : C.dim, cursor: "pointer",
+  });
 
   return (
     <div style={{
@@ -263,7 +364,13 @@ ${seg}
       fontFamily: mono, display: "flex", flexDirection: "column",
     }}>
       <style>{`*{box-sizing:border-box}body{margin:0}
-        @keyframes blip{0%,100%{opacity:1}50%{opacity:.2}}`}</style>
+        @keyframes blip{0%,100%{opacity:1}50%{opacity:.2}}
+        .leaflet-container{background:${C.deep}!important;font-family:${mono}}
+        .leaflet-control-attribution{
+          background:rgba(4,20,29,.8)!important;color:${C.dim}!important;font-size:9px!important}
+        .leaflet-control-attribution a{color:${C.dim}!important}
+        .leaflet-bar a{background:${C.panel}!important;color:${C.head}!important;
+          border-color:${C.rule}!important}`}</style>
 
       {/* 状態バー */}
       <div style={{
@@ -276,10 +383,11 @@ ${seg}
           animation: rec ? "blip 1.8s ease-in-out infinite" : "none",
         }} />
         <span style={{ fontSize: 12, color: C.head }}>
-          {rec ? "記録中" : pts.length ? "停止中" : "待機中"}
+          {online ? (rec ? "記録中" : pts.length ? "停止中" : "待機中")
+                  : "オフライン｜航跡は記録中です"}
         </span>
         <span style={{ marginLeft: "auto", fontSize: 11, color: C.dim }}>
-          {acc != null ? `精度 ±${acc.toFixed(0)}m` : "—"}
+          {acc != null ? `±${acc.toFixed(0)}m` : "—"}
         </span>
       </div>
 
@@ -290,23 +398,30 @@ ${seg}
         }}>{err}</div>
       )}
 
-      {/* プロット */}
-      <div ref={wrapRef} style={{ position: "relative", flex: 1, minHeight: 300 }}>
-        <canvas ref={canvasRef} style={{ display: "block" }} />
-        {!view && !err && (
+      {/* 地図（圏内） / 航跡のみ（圏外） */}
+      <div ref={wrapRef} style={{ position: "relative", flex: 1, minHeight: 340 }}>
+        {online ? (
+          <div ref={mapElRef} style={{ position: "absolute", inset: 0 }} />
+        ) : (
+          <canvas ref={canvasRef} style={{ display: "block" }} />
+        )}
+
+        {/* レイヤー切り替え */}
+        {online && (
           <div style={{
-            position: "absolute", inset: 0, display: "flex",
-            alignItems: "center", justifyContent: "center",
-            fontSize: 12, color: C.dim, textAlign: "center", padding: 24, lineHeight: 1.9,
+            position: "absolute", top: 12, right: 12, zIndex: 500,
+            display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end",
           }}>
-            記録を開始して、10m 以上動いてください。<br />
-            屋外で車を走らせるのが確実です。
+            <button onClick={() => setSeamark((v) => !v)} style={chip(seamark)}>航路標識</button>
+            <button onClick={() => setFollow((v) => !v)} style={chip(follow)}>自船追従</button>
           </div>
         )}
+
+        {/* 計器 */}
         {last && (
           <div style={{
-            position: "absolute", top: 13, left: 13,
-            background: "rgba(4,20,29,.76)", border: `1px solid ${C.rule}`, padding: "8px 12px",
+            position: "absolute", top: 12, left: 12, zIndex: 500,
+            background: "rgba(4,20,29,.82)", border: `1px solid ${C.rule}`, padding: "8px 12px",
           }}>
             <div style={{ fontSize: 24, fontWeight: 600, color: C.head }}>
               {(last.kn || 0).toFixed(1)}
@@ -316,6 +431,15 @@ ${seg}
               {String(Math.round(last.hdg || 0)).padStart(3, "0")}° ·{" "}
               {last.lat.toFixed(4)}N {last.lng.toFixed(4)}E
             </div>
+          </div>
+        )}
+
+        {!pts.length && !err && (
+          <div style={{
+            position: "absolute", bottom: 16, left: 0, right: 0, zIndex: 500,
+            fontSize: 11, color: C.dim, textAlign: "center", pointerEvents: "none",
+          }}>
+            記録を開始して 10m 以上動いてください
           </div>
         )}
       </div>
