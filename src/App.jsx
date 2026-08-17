@@ -112,6 +112,8 @@ export default function App() {
   const [showWx, setShowWx] = useState(false);
   // 海況をどこで取るか。src: gps=自船 / center=地図中心 / manual=手で動かした
   const [wxPoint, setWxPoint] = useState(null);
+  // 地点を動かすあいだパネルを縮める
+  const [wxMin, setWxMin] = useState(false);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
@@ -296,17 +298,33 @@ export default function App() {
       });
       const mk = L.marker([wxPoint.lat, wxPoint.lng], { icon, draggable: true, zIndexOffset: 900 })
         .addTo(map);
+      // つまんだ瞬間にパネルを縮めて地図を広く見せる
+      mk.on("dragstart", () => setWxMin(true));
       mk.on("dragend", () => {
         const ll = mk.getLatLng();
         const next = { lat: ll.lat, lng: ll.lng, src: "manual" };
         setWxPoint(next);
         loadWx(next);
+        setWxMin(false);
       });
       wxMarkRef.current = mk;
     } else {
       wxMarkRef.current.setLatLng([wxPoint.lat, wxPoint.lng]);
     }
   }, [L, showWx, wxPoint, loadWx]);
+
+  /* ---------- 地図をタップした場所へ地点を移す ---------- */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !showWx) return;
+    const onTap = (e) => {
+      const next = { lat: e.latlng.lat, lng: e.latlng.lng, src: "manual" };
+      setWxPoint(next);
+      loadWx(next);
+    };
+    map.on("click", onTap);
+    return () => map.off("click", onTap);
+  }, [showWx, loadWx]);
 
   /* ---------- 取得地点を地図の中心へ移す ---------- */
   const wxToCenter = useCallback(() => {
@@ -594,15 +612,44 @@ ${seg}
         )}
 
         {/* 海況パネル */}
-        {showWx && online && (
+        {showWx && online && wxMin && (
+          <div
+            onClick={() => setWxMin(false)}
+            style={{
+              position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 600,
+              background: "rgba(6,25,36,.94)", borderTop: `1px solid ${C.rule}`,
+              padding: "10px 16px", display: "flex", alignItems: "center", gap: 14,
+              cursor: "pointer",
+            }}
+          >
+            <span style={{ fontSize: 11, color: C.warn }}>海況</span>
+            {wx ? (
+              <>
+                <span style={{ fontSize: 12, color: windColor(wx.wind) }}>
+                  {dirName(wx.dir)} {wx.wind?.toFixed(1)}
+                  <span style={{ fontSize: 9, color: C.dim }}> m/s</span>
+                </span>
+                <span style={{ fontSize: 12, color: C.head }}>
+                  波 {wx.offshore && wx.wave != null ? `${wx.wave.toFixed(1)}m` : "—"}
+                </span>
+              </>
+            ) : (
+              <span style={{ fontSize: 11, color: C.dim }}>読み込み中…</span>
+            )}
+            <span style={{ marginLeft: "auto", fontSize: 10, color: C.dim }}>タップで展開 ▲</span>
+          </div>
+        )}
+
+        {showWx && online && !wxMin && (
           <div style={{
             position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 600,
             background: "rgba(6,25,36,.96)", borderTop: `1px solid ${C.rule}`,
-            padding: "14px 16px 16px", maxHeight: "72%", overflowY: "auto",
+            padding: "14px 16px 16px", maxHeight: "58%", overflowY: "auto",
           }}>
             <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
               <span style={{ ...label, color: C.head }}>海況</span>
               <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                <button onClick={() => setWxMin(true)} style={chip(false)}>縮小 ▼</button>
                 <button onClick={() => loadWx()} style={chip(false)}>更新</button>
                 <button onClick={() => setShowWx(false)} style={chip(false)}>閉じる</button>
               </span>
@@ -629,7 +676,7 @@ ${seg}
                   )}
                 </div>
                 <div style={{ fontSize: 9, color: C.dim, marginTop: 8, lineHeight: 1.7 }}>
-                  地図上の黄色い丸を指でドラッグしても動かせます
+                  地図をタップするか、黄色い丸をドラッグしても動かせます
                 </div>
               </div>
             )}
