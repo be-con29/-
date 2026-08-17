@@ -110,12 +110,15 @@ export default function App() {
   const [wx, setWx] = useState(null);
   const [wxBusy, setWxBusy] = useState(false);
   const [showWx, setShowWx] = useState(false);
+  // 海況をどこで取るか。src: gps=自船 / center=地図中心 / manual=手で動かした
+  const [wxPoint, setWxPoint] = useState(null);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
   const mapElRef = useRef(null);
   const seaRef = useRef(null);
   const radarRef = useRef(null);
+  const wxMarkRef = useRef(null);
   const segRef = useRef([]);
   const boatRef = useRef(null);
   const watchRef = useRef(null);
@@ -196,11 +199,10 @@ export default function App() {
   }, [L, radar]);
 
   /* ---------- 海況の取得 ---------- */
-  const loadWx = useCallback(async () => {
-    const p = pts[pts.length - 1];
-    const c = mapRef.current?.getCenter();
-    const lat = p?.lat ?? c?.lat ?? 34.6;
-    const lng = p?.lng ?? c?.lng ?? 137.1;
+  const loadWx = useCallback(async (pt) => {
+    const target = pt || wxPoint;
+    if (!target) return;
+    const { lat, lng } = target;
 
     setWxBusy(true);
     try {
@@ -232,6 +234,16 @@ export default function App() {
         });
       }
 
+      // 波のデータが実際に返ってきた地点と、指定した地点のズレを測る。
+      // 大きく離れていたら、指定地点は陸の上とみなす。
+      let offshore = b?.current?.wave_height != null;
+      let gridGap = null;
+      if (offshore && b?.latitude != null) {
+        const g = meters({ lat: b.latitude, lng: b.longitude }, { lat, lng });
+        gridGap = Math.hypot(g.x, g.y);
+        if (gridGap > 25000) offshore = false;
+      }
+
       setWx({
         temp: a.current?.temperature_2m,
         code: a.current?.weather_code,
@@ -242,6 +254,7 @@ export default function App() {
         wavePeriod: b?.current?.wave_period ?? null,
         waveDir: b?.current?.wave_direction ?? null,
         sst: b?.current?.sea_surface_temperature ?? null,
+        offshore, gridGap,
         hours,
         at: new Date(),
       });
@@ -249,11 +262,70 @@ export default function App() {
       setWx(null);
     }
     setWxBusy(false);
-  }, [pts]);
+  }, [wxPoint]);
 
+  /* ---------- パネルを開いたら取得地点を決める ---------- */
   useEffect(() => {
-    if (showWx && !wx && !wxBusy) loadWx();
-  }, [showWx, wx, wxBusy, loadWx]);
+    if (!showWx || wxPoint) return;
+    const p = pts[pts.length - 1];
+    const c = mapRef.current?.getCenter();
+    const next = p
+      ? { lat: p.lat, lng: p.lng, src: "gps" }
+      : { lat: c?.lat ?? 34.6, lng: c?.lng ?? 137.1, src: "center" };
+    setWxPoint(next);
+    loadWx(next);
+  }, [showWx, wxPoint, pts, loadWx]);
+
+  /* ---------- 取得地点のマーカー（ドラッグで動かせる） ---------- */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!L || !map) return;
+
+    if (!showWx || !wxPoint) {
+      if (wxMarkRef.current) { map.removeLayer(wxMarkRef.current); wxMarkRef.current = null; }
+      return;
+    }
+
+    if (!wxMarkRef.current) {
+      const icon = L.divIcon({
+        className: "",
+        html: `<div style="width:26px;height:26px;border-radius:50%;
+          border:2px solid ${C.warn};background:rgba(255,193,61,.22);
+          box-shadow:0 0 10px rgba(255,193,61,.55);cursor:grab"></div>`,
+        iconSize: [26, 26], iconAnchor: [13, 13],
+      });
+      const mk = L.marker([wxPoint.lat, wxPoint.lng], { icon, draggable: true, zIndexOffset: 900 })
+        .addTo(map);
+      mk.on("dragend", () => {
+        const ll = mk.getLatLng();
+        const next = { lat: ll.lat, lng: ll.lng, src: "manual" };
+        setWxPoint(next);
+        loadWx(next);
+      });
+      wxMarkRef.current = mk;
+    } else {
+      wxMarkRef.current.setLatLng([wxPoint.lat, wxPoint.lng]);
+    }
+  }, [L, showWx, wxPoint, loadWx]);
+
+  /* ---------- 取得地点を地図の中心へ移す ---------- */
+  const wxToCenter = useCallback(() => {
+    const c = mapRef.current?.getCenter();
+    if (!c) return;
+    const next = { lat: c.lat, lng: c.lng, src: "center" };
+    setWxPoint(next);
+    loadWx(next);
+  }, [loadWx]);
+
+  /* ---------- 取得地点を自船へ戻す ---------- */
+  const wxToBoat = useCallback(() => {
+    const p = pts[pts.length - 1];
+    if (!p) return;
+    const next = { lat: p.lat, lng: p.lng, src: "gps" };
+    setWxPoint(next);
+    loadWx(next);
+    mapRef.current?.panTo([p.lat, p.lng]);
+  }, [pts, loadWx]);
 
   /* ---------- 航跡の描画 ---------- */
   useEffect(() => {
@@ -528,19 +600,59 @@ ${seg}
             background: "rgba(6,25,36,.96)", borderTop: `1px solid ${C.rule}`,
             padding: "14px 16px 16px", maxHeight: "72%", overflowY: "auto",
           }}>
-            <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
               <span style={{ ...label, color: C.head }}>海況</span>
               <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-                <button onClick={loadWx} style={chip(false)}>更新</button>
+                <button onClick={() => loadWx()} style={chip(false)}>更新</button>
                 <button onClick={() => setShowWx(false)} style={chip(false)}>閉じる</button>
               </span>
             </div>
+
+            {/* 取得地点の表示と切り替え */}
+            {wxPoint && (
+              <div style={{
+                border: `1px solid ${C.rule}`, background: C.deep,
+                padding: "9px 11px", marginBottom: 12,
+              }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11, color: C.warn }}>
+                    {{ gps: "自船の位置", center: "地図の中心", manual: "手で指定した地点" }[wxPoint.src]}
+                  </span>
+                  <span style={{ fontSize: 11, color: C.dim }}>
+                    {wxPoint.lat.toFixed(4)}N {wxPoint.lng.toFixed(4)}E
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 7, marginTop: 8, flexWrap: "wrap" }}>
+                  <button onClick={wxToCenter} style={chip(false)}>地図の中心へ</button>
+                  {pts.length > 0 && (
+                    <button onClick={wxToBoat} style={chip(false)}>自船へ戻す</button>
+                  )}
+                </div>
+                <div style={{ fontSize: 9, color: C.dim, marginTop: 8, lineHeight: 1.7 }}>
+                  地図上の黄色い丸を指でドラッグしても動かせます
+                </div>
+              </div>
+            )}
 
             {wxBusy && <div style={{ fontSize: 12, color: C.dim, padding: "18px 0" }}>読み込み中…</div>}
 
             {!wxBusy && !wx && (
               <div style={{ fontSize: 12, color: C.dim, padding: "18px 0", lineHeight: 1.8 }}>
                 海況を取得できませんでした。電波状況を確認して「更新」を押してください。
+              </div>
+            )}
+
+            {!wxBusy && wx && !wx.offshore && (
+              <div style={{
+                border: `1px solid ${C.warn}`, background: "rgba(255,193,61,.09)",
+                padding: "11px 13px", marginBottom: 12,
+                fontSize: 11, color: C.warn, lineHeight: 1.8,
+              }}>
+                この地点は陸上のようです。波と水温は表示できません。<br />
+                <span style={{ color: C.dim }}>
+                  地図を海の上まで動かして「地図の中心へ」を押すか、黄色い丸を海へドラッグしてください。
+                  天気と風は陸上でも表示されます。
+                </span>
               </div>
             )}
 
@@ -570,18 +682,18 @@ ${seg}
                   </div>
                   <div style={{ background: C.deep, padding: "11px 13px" }}>
                     <div style={label}>波</div>
-                    <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
-                      {wx.wave != null ? `${wx.wave.toFixed(1)} m` : "—"}
+                    <div style={{ fontSize: 17, color: wx.offshore ? C.head : C.dim, marginTop: 4 }}>
+                      {wx.offshore && wx.wave != null ? `${wx.wave.toFixed(1)} m` : "—"}
                     </div>
                     <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>
-                      {wx.wavePeriod != null ? `周期 ${wx.wavePeriod.toFixed(0)}秒` : ""}
-                      {wx.waveDir != null ? ` · ${dirName(wx.waveDir)}から` : ""}
+                      {wx.offshore && wx.wavePeriod != null ? `周期 ${wx.wavePeriod.toFixed(0)}秒` : ""}
+                      {wx.offshore && wx.waveDir != null ? ` · ${dirName(wx.waveDir)}から` : ""}
                     </div>
                   </div>
                   <div style={{ background: C.deep, padding: "11px 13px" }}>
                     <div style={label}>水温</div>
-                    <div style={{ fontSize: 17, color: C.head, marginTop: 4 }}>
-                      {wx.sst != null ? `${wx.sst.toFixed(1)} ℃` : "—"}
+                    <div style={{ fontSize: 17, color: wx.offshore ? C.head : C.dim, marginTop: 4 }}>
+                      {wx.offshore && wx.sst != null ? `${wx.sst.toFixed(1)} ℃` : "—"}
                     </div>
                   </div>
                 </div>
@@ -594,7 +706,7 @@ ${seg}
                     return (
                       <div key={i} style={{ flex: 1, textAlign: "center" }}>
                         <div style={{ fontSize: 8, color: C.dim, marginBottom: 3 }}>
-                          {h.wave != null ? h.wave.toFixed(1) : ""}
+                          {wx.offshore && h.wave != null ? h.wave.toFixed(1) : ""}
                         </div>
                         <div style={{
                           height: Math.max(4, (v / maxWind) * 54),
