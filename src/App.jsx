@@ -14,25 +14,38 @@ const C = {
   red: "#FF5E5B", ok: "#4ED9C0", warn: "#FFC13D",
 };
 
-const RAMP = [
-  { kn: 0, c: [255, 122, 61] },
-  { kn: 4, c: [255, 193, 61] },
-  { kn: 10, c: [78, 217, 192] },
-  { kn: 20, c: [53, 168, 232] },
+const COLORS = [
+  [255, 122, 61],   // 停船・渋滞
+  [255, 193, 61],   // 流し・徐行
+  [78, 217, 192],   // 中速
+  [53, 168, 232],   // 航行・巡航
 ];
-function speedColor(kn) {
-  if (kn <= 0) return RAMP[0].c;
-  for (let i = 1; i < RAMP.length; i++) {
-    if (kn <= RAMP[i].kn) {
-      const a = RAMP[i - 1], b = RAMP[i];
-      const t = (kn - a.kn) / (b.kn - a.kn);
-      return [0, 1, 2].map((j) => Math.round(a.c[j] + (b.c[j] - a.c[j]) * t));
+
+// 色が変わる速度。内部はすべてノットで持ち、表示だけ換算する
+const STOPS = {
+  kn:  [0, 4, 10, 20],                    // 船：0 / 4 / 10 / 20 kn
+  kmh: [0, 8.1, 21.6, 43.2],              // 車：0 / 15 / 40 / 80 km/h をktに換算
+};
+const SLOW = { kn: 5, kmh: 8.1 };         // この速度未満は線を太くする
+
+function speedColor(kn, unit = "kn") {
+  const s = STOPS[unit];
+  if (kn <= s[0]) return COLORS[0];
+  for (let i = 1; i < 4; i++) {
+    if (kn <= s[i]) {
+      const t = (kn - s[i - 1]) / (s[i] - s[i - 1]);
+      return [0, 1, 2].map((j) =>
+        Math.round(COLORS[i - 1][j] + (COLORS[i][j] - COLORS[i - 1][j]) * t));
     }
   }
-  return RAMP[3].c;
+  return COLORS[3];
 }
 const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
 const KN = 0.514444;
+
+// ノット → 表示する単位
+const conv = (kn, unit) => (unit === "kn" ? kn : kn * 1.852);
+const unitLabel = (unit) => (unit === "kn" ? "kn" : "km/h");
 
 const DIRS = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
               "南","南南西","南西","西南西","西","西北西","北西","北北西"];
@@ -175,6 +188,13 @@ export default function App() {
   const [wxTab, setWxTab] = useState("wx");   // wx = 気象 / tide = 潮汐
   const [tide, setTide] = useState(null);
   const [tideBusy, setTideBusy] = useState(false);
+  // 速度の単位。船=kn / 車=km/h。選んだら端末に覚えさせる
+  const [unit, setUnit] = useState(() => {
+    try { return localStorage.getItem("funaato:unit") || "kn"; } catch { return "kn"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("funaato:unit", unit); } catch {}
+  }, [unit]);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
@@ -480,8 +500,8 @@ export default function App() {
       const gap = b.t - a.t > 15000; // 15秒以上あいたら線をつながない
       segRef.current.push(
         L.polyline([[a.lat, a.lng], [b.lat, b.lng]], {
-          color: rgb(speedColor((a.kn + b.kn) / 2)),
-          weight: a.kn < 5 ? 6 : 4,
+          color: rgb(speedColor((a.kn + b.kn) / 2, unit)),
+          weight: a.kn < SLOW[unit] ? 6 : 4,
           opacity: gap ? 0 : 0.9,
           lineCap: "round",
         }).addTo(map)
@@ -494,7 +514,7 @@ export default function App() {
       }).addTo(map);
     } else boatRef.current.setLatLng([cur.lat, cur.lng]);
     if (follow) map.panTo([cur.lat, cur.lng], { animate: true, duration: 0.4 });
-  }, [L, pts, follow]);
+  }, [L, pts, follow, unit]);
 
   /* ---------- 記録 ---------- */
   const start = useCallback(async () => {
@@ -598,16 +618,16 @@ export default function App() {
     g.lineCap = g.lineJoin = "round"; g.shadowBlur = 9;
     for (let i = 1; i < xy.length; i++) {
       const a = xy[i - 1], b = xy[i];
-      const col = rgb(speedColor((a.kn + b.kn) / 2));
+      const col = rgb(speedColor((a.kn + b.kn) / 2, unit));
       g.strokeStyle = col; g.shadowColor = col;
-      g.lineWidth = a.kn < 5 ? 3.4 : 2.2;
+      g.lineWidth = a.kn < SLOW[unit] ? 3.4 : 2.2;
       g.beginPath(); g.moveTo(X(a), Y(a)); g.lineTo(X(b), Y(b)); g.stroke();
     }
     g.shadowBlur = 0;
     const cur = xy[xy.length - 1];
     g.fillStyle = C.red;
     g.beginPath(); g.arc(X(cur), Y(cur), 5, 0, 6.284); g.fill();
-  }, [online, view]);
+  }, [online, view, unit]);
 
   /* ---------- 書き出し ---------- */
   const save = (kind) => {
@@ -704,6 +724,10 @@ ${seg}
             position: "absolute", top: 12, right: 12, zIndex: 500,
             display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end",
           }}>
+            <button onClick={() => setUnit((u) => (u === "kn" ? "kmh" : "kn"))}
+                    style={chip(false)}>
+              {unit === "kn" ? "船 kn" : "車 km/h"}
+            </button>
             <button onClick={() => setShowWx((v) => !v)} style={chip(showWx)}>海況</button>
             <button onClick={() => setRadar((v) => !v)} style={chip(radar)}>雨雲</button>
             <button onClick={() => setSeamark((v) => !v)} style={chip(seamark)}>航路標識</button>
@@ -727,8 +751,8 @@ ${seg}
             background: "rgba(4,20,29,.82)", border: `1px solid ${C.rule}`, padding: "8px 12px",
           }}>
             <div style={{ fontSize: 24, fontWeight: 600, color: C.head }}>
-              {(last.kn || 0).toFixed(1)}
-              <span style={{ fontSize: 11, color: C.dim, marginLeft: 4 }}>kn</span>
+              {conv(last.kn || 0, unit).toFixed(1)}
+              <span style={{ fontSize: 11, color: C.dim, marginLeft: 4 }}>{unitLabel(unit)}</span>
             </div>
             <div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>
               {String(Math.round(last.hdg || 0)).padStart(3, "0")}° ·{" "}
@@ -1054,7 +1078,7 @@ ${seg}
       }}>
         {[
           ["距離", view ? (view.dist / 1000).toFixed(2) : "0.00", "km"],
-          ["最高", view ? view.max.toFixed(1) : "0.0", "kn"],
+          ["最高", view ? conv(view.max, unit).toFixed(1) : "0.0", unitLabel(unit)],
           ["点数", pts.length, ""],
           ["5m間引", view ? view.thin : 0, ""],
         ].map(([k, v, u]) => (
